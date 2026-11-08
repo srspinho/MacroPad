@@ -30,7 +30,7 @@ O LED RGB da placa indica o estado: **azul** = aguardando, **verde** = recebendo
 ## Estrutura
 
 ```
-./
+MacroPad/
 ├── firmware/keystats_cyd/
 │   ├── keystats_cyd.ino   # firmware do painel
 │   ├── lgfx_cyd.h         # configuração do display/touch do CYD
