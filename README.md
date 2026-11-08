@@ -54,11 +54,28 @@ MacroPad/
 
 > No Windows, se a porta não aparecer, instale o driver **CH340** (é o chip USB-serial mais comum no CYD).
 
-### Variantes do CYD
+### Configurar o display (primeiro boot)
 
-Em `lgfx_cyd.h`:
-- Placa com **duas portas USB** (micro-USB + USB-C): descomente `#define CYD_PANEL_ST7789`.
-- Cores invertidas (fundo branco, cores "negativas"): descomente `#define CYD_INVERT_COLORS`.
+Existem várias revisões do CYD com controladores de display diferentes (ILI9341, "ILI9341 tipo 2", ST7789). Com o perfil errado, a imagem sai **espelhada**, **em pé em vez de deitada**, com faixas brancas ou cores invertidas.
+
+Por isso, no primeiro boot o firmware abre um **assistente** com uma tela de teste. O LED fica roxo enquanto ele está aberto.
+
+| Ação | Efeito |
+|---|---|
+| Apertar **BOOT** | testa o próximo perfil (a placa reinicia sozinha) |
+| **Tocar** na tela | gira ou espelha a imagem (4 orientações) |
+| **Segurar BOOT por 2 s** | salva e começa a usar o painel |
+
+O perfil está certo quando:
+- a imagem está **deitada** (paisagem),
+- a **moldura branca** encosta nas 4 bordas, sem faixa branca sobrando,
+- o texto **lê da esquerda para a direita**,
+- cada barra de cor bate com o nome (VERMELHO, VERDE, AZUL, BRANCO) e a faixa preta é preta.
+
+Mesmo que a tela esteja embaralhada, continue apertando **BOOT**: são 8 perfis. A escolha fica gravada na flash e vale também para gravações futuras do firmware.
+Para refazer a configuração, **segure BOOT por 3 s** durante o uso normal.
+
+O assistente também escreve o perfil atual no Monitor Serial (115200 baud).
 
 ### Layout do teclado (mapa de calor)
 

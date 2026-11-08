@@ -9,6 +9,13 @@
 
   Toque na tela (ou aperte o botao BOOT) para trocar de tela.
 
+  CONFIGURACAO DO DISPLAY: existem varias revisoes do CYD com displays diferentes.
+  No primeiro boot (ou segurando BOOT por 3 s) abre um assistente com uma tela de teste:
+    - aperte BOOT          -> testa o proximo perfil de display (a placa reinicia)
+    - toque na tela        -> gira / espelha a imagem
+    - segure BOOT por 2 s  -> salva e comeca a usar o painel
+  A escolha fica gravada na flash e sobrevive a novas gravacoes do firmware.
+
   Bibliotecas (Gerenciador de Bibliotecas da IDE):
     - LovyanGFX   (testado com 1.2.0)
     - ArduinoJson (testado com 7.2.1)
@@ -24,6 +31,7 @@
 #include "lgfx_cyd.h"
 #include "keyboard_layout.h"
 #include <ArduinoJson.h>
+#include <Preferences.h>
 
 // ---------------------------------------------------------------- configuracao
 static const uint32_t SERIAL_BAUD     = 115200;
@@ -57,6 +65,7 @@ struct Stats {
 };
 
 static LGFX        lcd;
+static Preferences prefs;
 static LGFX_Sprite sprKpm(&lcd);
 static LGFX_Sprite sprGraph(&lcd);
 static LGFX_Sprite sprRow(&lcd);
@@ -502,12 +511,22 @@ static bool pollInput() {
   bool fired = false;
 
   int32_t tx, ty;
+  static uint32_t bootDownAt = 0;
   bool touched = lcd.getTouch(&tx, &ty) > 0;
   bool pressed = digitalRead(PIN_BOOT) == LOW;
   uint32_t now = millis();
 
+  // BOOT: clique curto (ao soltar) troca de tela; segurar 3 s abre o assistente do display
+  if (pressed && !wasPressed) bootDownAt = now;
+  if (pressed && now - bootDownAt > 3000) {
+    prefs.putBool("dok", false);
+    delay(50);
+    ESP.restart();
+  }
+  bool bootClick = !pressed && wasPressed && now - bootDownAt < 1000;
+
   if (now - lastChange > 250) {
-    if ((touched && !wasTouched) || (pressed && !wasPressed)) {
+    if ((touched && !wasTouched) || bootClick) {
       fired = true;
       lastChange = now;
     }
@@ -515,6 +534,111 @@ static bool pollInput() {
   wasTouched = touched;
   wasPressed = pressed;
   return fired;
+}
+
+// ---------------------------------------------------------------- assistente do display
+static const uint8_t ROTATIONS[] = {1, 5, 3, 7};  // normal, espelhada, 180 graus, 180 espelhada
+
+static void drawSetupScreen(uint8_t prof, uint8_t rotIdx) {
+  lcd.fillScreen(C_BG);
+  lcd.drawRect(0, 0, 320, 240, C_TEXT);       // a moldura deve encostar nas 4 bordas
+  lcd.drawRect(2, 2, 316, 236, C_DIM);
+
+  lcd.setTextDatum(top_left);
+  lcd.setFont(&fonts::FreeSansBold9pt7b);
+  lcd.setTextColor(C_ACCENT, C_BG);
+  lcd.drawString("CONFIGURAR DISPLAY", 12, 10);
+
+  char buf[64];
+  lcd.setFont(&fonts::Font2);
+  lcd.setTextColor(C_TEXT, C_BG);
+  snprintf(buf, sizeof(buf), "Perfil %u/%u: %s", prof + 1, DISPLAY_PROFILE_COUNT,
+           DISPLAY_PROFILES[prof].name);
+  lcd.drawString(buf, 12, 34);
+  snprintf(buf, sizeof(buf), "Orientacao %u/4", rotIdx + 1);
+  lcd.drawString(buf, 12, 52);
+  lcd.drawString("Este texto le da esquerda p/ direita -->", 12, 70);
+
+  // barras de cor rotuladas: confira se cada cor bate com o nome
+  struct { uint16_t c; const char *n; uint16_t fg; } bars[] = {
+    {0xF800, "VERMELHO", 0xFFFF}, {0x07E0, "VERDE", 0x0000},
+    {0x001F, "AZUL", 0xFFFF},     {0xFFFF, "BRANCO", 0x0000},
+  };
+  for (int i = 0; i < 4; i++) {
+    int x = 12 + i * 75;
+    lcd.fillRect(x, 94, 70, 34, bars[i].c);
+    lcd.setFont(&fonts::Font0);
+    lcd.setTextDatum(middle_center);
+    lcd.setTextColor(bars[i].fg, bars[i].c);
+    lcd.drawString(bars[i].n, x + 35, 111);
+  }
+  lcd.fillRect(12, 132, 296, 8, 0x0000);  // preto deve ser preto (nao branco)
+
+  lcd.setFont(&fonts::Font2);
+  lcd.setTextDatum(top_left);
+  lcd.setTextColor(C_DIM, C_BG);
+  lcd.drawString("Aperte BOOT ....... proximo perfil", 12, 150);
+  lcd.drawString("Toque na tela ..... girar / espelhar", 12, 170);
+  lcd.setTextColor(C_OK, C_BG);
+  lcd.drawString("Segure BOOT 2 s ... salvar e usar", 12, 190);
+  lcd.setTextColor(C_DIM, C_BG);
+  lcd.drawString("Tudo certo = moldura nas 4 bordas,", 12, 210);
+}
+
+// Bloqueia ate o usuario salvar. Trocar de perfil reinicia a placa.
+static void runDisplaySetup(uint8_t prof, uint8_t rot) {
+  setLed(true, false, true);  // roxo = modo de configuracao
+  uint8_t ri = 0;
+  for (uint8_t i = 0; i < 4; i++) if (ROTATIONS[i] == rot) ri = i;
+
+  Serial.println(F("[display] Assistente de configuracao:"));
+  Serial.println(F("  BOOT = proximo perfil | toque = girar/espelhar | segure BOOT 2 s = salvar"));
+  Serial.printf("[display] perfil %u: %s, rotacao %u\n", prof + 1, DISPLAY_PROFILES[prof].name, rot);
+
+  lcd.setRotation(ROTATIONS[ri]);
+  drawSetupScreen(prof, ri);
+
+  bool wasTouched = false;
+  uint32_t lastTouch = 0;
+  while (true) {
+    if (digitalRead(PIN_BOOT) == LOW) {
+      uint32_t t0 = millis();
+      bool saved = false;
+      while (digitalRead(PIN_BOOT) == LOW) {
+        if (!saved && millis() - t0 > 2000) {
+          saved = true;
+          prefs.putUChar("drot", ROTATIONS[ri]);
+          prefs.putBool("dok", true);
+          lcd.fillRect(60, 95, 200, 50, C_OK);
+          lcd.setFont(&fonts::FreeSansBold12pt7b);
+          lcd.setTextDatum(middle_center);
+          lcd.setTextColor(0x0000, C_OK);
+          lcd.drawString("SALVO!", 160, 120);
+          Serial.println(F("[display] configuracao salva"));
+        }
+        delay(10);
+      }
+      if (saved) { lcd.fillScreen(C_BG); return; }
+      if (millis() - t0 > 30) {  // toque curto: proximo perfil
+        prefs.putUChar("dprof", (prof + 1) % DISPLAY_PROFILE_COUNT);
+        prefs.putUChar("drot", ROTATIONS[ri]);
+        delay(50);
+        ESP.restart();
+      }
+    }
+
+    int32_t tx, ty;
+    bool touched = lcd.getTouch(&tx, &ty) > 0;
+    if (touched && !wasTouched && millis() - lastTouch > 400) {
+      lastTouch = millis();
+      ri = (ri + 1) % 4;
+      lcd.setRotation(ROTATIONS[ri]);
+      drawSetupScreen(prof, ri);
+      Serial.printf("[display] rotacao %u\n", ROTATIONS[ri]);
+    }
+    wasTouched = touched;
+    delay(20);
+  }
 }
 
 // ---------------------------------------------------------------- setup / loop
@@ -528,10 +652,21 @@ void setup() {
   pinMode(PIN_LED_B, OUTPUT);
   setLed(false, false, true);  // azul = aguardando
 
+  // perfil do display salvo na flash (ver lgfx_cyd.h)
+  prefs.begin("keystats", false);
+  uint8_t prof = prefs.getUChar("dprof", 0);
+  if (prof >= DISPLAY_PROFILE_COUNT) prof = 0;
+  uint8_t rot = prefs.getUChar("drot", 1);
+  bool displayOk = prefs.getBool("dok", false);
+
+  lcd.configure(prof);
   lcd.init();
-  lcd.setRotation(1);          // paisagem, 320x240
+  lcd.setRotation(rot);        // paisagem, 320x240
   lcd.setBrightness(200);
   lcd.fillScreen(C_BG);
+
+  if (!displayOk) runDisplaySetup(prof, rot);
+  setLed(false, false, true);
 
   // sprites evitam o "pisca" ao redesenhar; se faltar RAM, desenha direto na tela
   sprKpm.setColorDepth(16);
