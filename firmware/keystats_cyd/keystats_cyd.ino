@@ -97,7 +97,10 @@ static bool     topDirty      = true;
 static uint16_t hist[HIST_N];
 static uint8_t  histHead = 0;           // proxima posicao a escrever
 
+// Tipos usados em assinaturas de funcoes ficam aqui no topo: a IDE do Arduino gera
+// prototipos automaticos logo apos os #include, e eles precisam enxergar esses tipos.
 enum Screen : uint8_t { SCR_LIVE = 0, SCR_GAME, SCR_TOP, SCR_HEAT, SCR_COUNT };
+enum InputEvent : uint8_t { IN_NONE, IN_TAP, IN_LONG };
 static Screen screen = SCR_LIVE;
 
 static char    lineBuf[2048];
@@ -212,7 +215,8 @@ static void handleLine(const char *line) {
     st.gPeak  = game["peak"]  | 0;
     st.gTime  = game["time"]  | 0;
     uint8_t n = 0;
-    for (JsonArray item : game["top"].as<JsonArray>()) {
+    JsonArray gameTop = game["top"];
+    for (JsonArray item : gameTop) {
       if (n >= GAME_TOP_N) break;
       strlcpy(st.gTopKey[n], item[0] | "?", sizeof(st.gTopKey[n]));
       st.gTopVal[n] = item[1] | 0;
@@ -640,8 +644,6 @@ static void nextScreen() {
   topDirty = heatDirty = false;  // a tela inteira e redesenhada abaixo
   redrawAll();
 }
-
-enum InputEvent : uint8_t { IN_NONE, IN_TAP, IN_LONG };
 
 // Toque/clique curto = IN_TAP; toque longo (1 s) ou BOOT segurado por 1-3 s = IN_LONG;
 // BOOT segurado por mais de 3 s = abre o assistente do display.
