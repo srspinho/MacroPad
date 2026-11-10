@@ -15,15 +15,24 @@ os totais e as teclas mais usadas.
 | Tela | Conteúdo |
 |---|---|
 | **Ao vivo** | KPM atual (a cor muda conforme a intensidade), pico de KPM, teclas da sessão, total histórico e gráfico dos últimos 60 s |
+| **Por jogo** | Estatísticas do jogo/app em foco: teclas no jogo, teclas nesta sessão, recorde de KPM, tempo em foco e as 5 teclas mais usadas |
 | **Top teclas** | As 8 teclas mais usadas, com barras proporcionais |
-| **Mapa de calor** | O teclado inteiro (formato 75%, ABNT2 ou ANSI) colorido do azul ao vermelho conforme o uso de cada tecla |
+| **Mapa de calor** | O teclado inteiro (formato 75%, ABNT2 ou ANSI) colorido do azul ao vermelho conforme o uso de cada tecla, em 3 modos: **histórico**, **sessão** e **jogo atual** |
+
+![Prévia da tela por jogo](docs/preview_game.png)
 
 ![Prévia da tela de mapa de calor](docs/preview_heatmap.png)
 
 *Prévia gerada por simulação, com a mesma geometria e as mesmas cores do firmware. No display real, as fontes são as bitmap do LovyanGFX.*
 
 O cabeçalho mostra o status da conexão, o aplicativo/jogo em foco e o tempo de sessão.
-Para trocar de tela, **toque no display** ou aperte o botão **BOOT**.
+**Controles:**
+
+| Ação | Efeito |
+|---|---|
+| Toque rápido no display ou clique no **BOOT** | próxima tela |
+| **Segurar o dedo** na tela por 1 s (ou o BOOT por 1–3 s) no mapa de calor | alterna Histórico → Sessão → Jogo (o modo fica salvo) |
+| Segurar o **BOOT** por mais de 3 s | abre o assistente do display |
 
 O LED RGB da placa indica o estado: **azul** = aguardando, **verde** = recebendo dados, **vermelho** = conexão perdida.
 
@@ -161,6 +170,7 @@ No modo `--demo`, os dados ficam em um arquivo separado (`demo_state.json`) para
 - **Pico:** o maior KPM registrado na sessão atual do agente.
 - **Sessão / Tempo:** contados desde que o agente foi iniciado.
 - **Total / Top teclas:** histórico acumulado, salvo em disco a cada 30 s e ao sair.
+- **Por jogo:** cada tecla conta para o processo em foco no momento (ex.: `cs2.exe`). O **recorde de KPM** e o **tempo em foco** de cada jogo também são guardados. Ficam no histórico os 60 apps mais usados.
 - Teclas seguradas contam **uma vez**, porque o auto-repeat do sistema é ignorado.
 - **Mapa de calor:** usa o histórico total. A intensidade é `255 × √(contagem / máximo)`; com a raiz quadrada, teclas pouco usadas continuam visíveis ao lado do W/A/S/D.
 
@@ -183,10 +193,18 @@ No modo `--demo`, os dados ficam em um arquivo separado (`demo_state.json`) para
 | `app` | processo em foco (até 39 caracteres) |
 | `top` | até 8 pares `[tecla, contagem]`, em ordem decrescente |
 
-A cada 2 s, o agente envia também uma linha com o mapa de calor, com intensidades de 1 a 255 por tecla:
+A mensagem principal traz também o jogo em foco:
 
 ```json
-{"heat":{"W":255,"A":204,"SPACE":195,"CCED":14},"hmax":5123}
+"game":{"name":"cs2.exe","total":9120,"sess":812,"peak":610,"time":7260,"top":[["W",2100],["A",1500]]}
+```
+
+O agente envia também os mapas de calor, com intensidades de 1 a 255 por tecla. São três modos, um por linha, e cada um é reenviado a cada 2 s:
+
+```json
+{"heat":{"W":255,"A":204,"SPACE":195,"CCED":14},"hmax":5123,"scope":"total"}
+{"heat":{"W":255,"D":180},"hmax":312,"scope":"sess"}
+{"heat":{"W":255,"A":220},"hmax":2100,"scope":"game","name":"cs2.exe"}
 ```
 
 Nomes de tecla: letras e dígitos (`A`, `7`), pontuação pela tecla física sem Shift (`-`, `;`, `/`…),
@@ -205,9 +223,9 @@ python -m unittest test_keystats_agent.py
 ## Próximos passos
 
 - ~~Tela de **mapa de calor** do teclado (layout ABNT2/ANSI)~~ ✅ v2
-- Alternar o mapa de calor entre **sessão** e **histórico** com um toque longo
+- ~~Alternar o mapa de calor entre **sessão** e **histórico** com um toque longo~~ ✅
+- ~~Estatísticas **por jogo**~~ ✅
 - Interface com **LVGL** e animações
-- Estatísticas **por jogo**
 - Conexão por **Wi-Fi** (WebSocket), sem cabo
 - Histórico no cartão SD e resumo diário/semanal
 - Case impresso em 3D

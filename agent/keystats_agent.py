@@ -42,8 +42,11 @@ except ImportError:  # pragma: no cover
 KPM_WINDOW_S = 10.0     # janela movel do KPM (curta = medidor mais "vivo")
 SEND_INTERVAL_S = 0.2   # 5 atualizacoes por segundo
 SAVE_INTERVAL_S = 30.0
-HEAT_INTERVAL_S = 2.0   # mapa de calor muda devagar; manda com menos frequencia
+HEAT_INTERVAL_S = 2.0   # cada mapa de calor e reenviado a cada 2 s (os 3 modos se alternam)
 TOP_N = 8
+GAME_TOP_N = 5
+MAX_APPS = 60           # apps/jogos guardados no historico
+HEAT_SCOPES = ("total", "sess", "game")
 BAUD = 115200
 
 # VIDs dos conversores USB-serial comuns em placas ESP32
@@ -146,6 +149,22 @@ def key_name(key, layout="abnt2"):
 
 
 # --------------------------------------------------------------------------- estatisticas
+class AppStats:
+    """Estatisticas de um aplicativo/jogo (pelo nome do processo em foco)."""
+
+    def __init__(self, data=None):
+        data = data or {}
+        self.total = int(data.get("total", 0))
+        self.counts = collections.Counter({k: int(v) for k, v in data.get("counts", {}).items()})
+        self.peak = int(data.get("peak", 0))      # recorde de KPM neste app
+        self.time = float(data.get("time", 0.0))  # segundos em foco
+        self.session = 0                          # teclas nesta sessao (nao persiste)
+
+    def to_dict(self):
+        return {"total": self.total, "counts": dict(self.counts),
+                "peak": self.peak, "time": round(self.time)}
+
+
 class KeyStats:
     def __init__(self, state_file: Path):
         self.state_file = state_file
@@ -153,10 +172,14 @@ class KeyStats:
         self.total = 0
         self.counts = collections.Counter()
         self.session = 0
+        self.session_counts = collections.Counter()
         self.session_start = time.monotonic()
         self.recent = collections.deque()
         self.peak = 0
         self.pressed = set()
+        self.apps = {}               # nome do processo -> AppStats
+        self.app = ""                # app em foco agora
+        self._last_tick = None
         self._load()
 
     # ---- persistencia
@@ -165,18 +188,28 @@ class KeyStats:
             data = json.loads(self.state_file.read_text(encoding="utf-8"))
             self.total = int(data.get("total", 0))
             self.counts.update({k: int(v) for k, v in data.get("counts", {}).items()})
+            self.apps = {name: AppStats(d) for name, d in data.get("apps", {}).items()}
         except FileNotFoundError:
             pass
-        except (ValueError, OSError) as exc:
+        except (ValueError, OSError, AttributeError, TypeError) as exc:
             log.warning("nao consegui ler %s: %s", self.state_file, exc)
 
     def save(self):
         with self.lock:
-            data = {"total": self.total, "counts": dict(self.counts)}
+            # guarda so os apps mais usados, para o arquivo nao crescer sem limite
+            keep = sorted(self.apps.items(), key=lambda kv: kv[1].total, reverse=True)[:MAX_APPS]
+            data = {"total": self.total, "counts": dict(self.counts),
+                    "apps": {name: a.to_dict() for name, a in keep}}
         self.state_file.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.state_file.with_suffix(".tmp")
         tmp.write_text(json.dumps(data), encoding="utf-8")
         os.replace(tmp, self.state_file)
+
+    def _app_stats(self, name):
+        a = self.apps.get(name)
+        if a is None:
+            a = self.apps[name] = AppStats()
+        return a
 
     # ---- eventos
     def press(self, name: str):
@@ -187,7 +220,13 @@ class KeyStats:
             self.total += 1
             self.session += 1
             self.counts[name] += 1
+            self.session_counts[name] += 1
             self.recent.append(time.monotonic())
+            if self.app:
+                a = self._app_stats(self.app)
+                a.total += 1
+                a.session += 1
+                a.counts[name] += 1
 
     def release(self, name: str):
         with self.lock:
@@ -195,33 +234,61 @@ class KeyStats:
 
     # ---- leitura
     def snapshot(self, app: str = "") -> dict:
+        """Estado atual. Tambem registra o app em foco e soma o tempo em foco."""
         now = time.monotonic()
+        app = (app or "")[:39]
         with self.lock:
+            if self._last_tick is not None and self.app:
+                self._app_stats(self.app).time += min(now - self._last_tick, 5.0)
+            self._last_tick = now
+            self.app = app
+
             while self.recent and now - self.recent[0] > KPM_WINDOW_S:
                 self.recent.popleft()
             kpm = round(len(self.recent) * 60.0 / KPM_WINDOW_S)
             self.peak = max(self.peak, kpm)
             top = [[k, v] for k, v in self.counts.most_common(TOP_N)]
+
+            game = {"name": "", "total": 0, "sess": 0, "peak": 0, "time": 0, "top": []}
+            if app:
+                a = self._app_stats(app)
+                a.peak = max(a.peak, kpm)
+                game = {"name": app, "total": a.total, "sess": a.session, "peak": a.peak,
+                        "time": int(a.time),
+                        "top": [[k, v] for k, v in a.counts.most_common(GAME_TOP_N)]}
             return {
                 "kpm": kpm,
                 "peak": self.peak,
                 "sess": self.session,
                 "total": self.total,
                 "up": int(now - self.session_start),
-                "app": app[:39],
+                "app": app,
                 "top": top,
+                "game": game,
             }
 
-    def heat_snapshot(self) -> dict:
+    def heat_snapshot(self, scope: str = "total") -> dict:
         """Intensidade 1..255 por tecla (escala raiz quadrada, para teclas pouco
-        usadas continuarem visiveis ao lado de W/A/S/D)."""
+        usadas continuarem visiveis ao lado de W/A/S/D).
+        scope: "total" (historico), "sess" (sessao) ou "game" (app em foco)."""
         with self.lock:
-            items = [(k, v) for k, v in self.counts.most_common(120) if v > 0]
-        if not items:
-            return {"heat": {}, "hmax": 0}
-        hmax = items[0][1]
-        heat = {k: max(1, round(255 * (v / hmax) ** 0.5)) for k, v in items}
-        return {"heat": heat, "hmax": hmax}
+            name = ""
+            if scope == "sess":
+                counts = self.session_counts
+            elif scope == "game":
+                name = self.app
+                counts = self.apps[name].counts if name in self.apps else collections.Counter()
+            else:
+                counts = self.counts
+            items = [(k, v) for k, v in counts.most_common(120) if v > 0]
+        msg = {"heat": {}, "hmax": 0, "scope": scope}
+        if scope == "game":
+            msg["name"] = name
+        if items:
+            hmax = items[0][1]
+            msg["heat"] = {k: max(1, round(255 * (v / hmax) ** 0.5)) for k, v in items}
+            msg["hmax"] = hmax
+        return msg
 
 
 # --------------------------------------------------------------------------- app ativo
@@ -271,6 +338,15 @@ class AppWatcher(threading.Thread):
         while True:
             self.current = active_app()
             time.sleep(self.interval)
+
+
+class DemoAppWatcher:
+    """No modo --demo, alterna entre jogos ficticios a cada 30 s."""
+    APPS = ("cs2.exe", "valorant.exe", "eldenring.exe")
+
+    @property
+    def current(self):
+        return self.APPS[int(time.monotonic() // 30) % len(self.APPS)]
 
 
 # --------------------------------------------------------------------------- fontes de eventos
@@ -394,7 +470,11 @@ def run(args, stop: threading.Event, status: dict):
         log.info("Capturando teclado (apenas contagens).")
 
     watcher = None
-    if not args.no_app:
+    if args.no_app:
+        pass
+    elif args.demo:
+        watcher = DemoAppWatcher()
+    else:
         watcher = AppWatcher()
         watcher.start()
 
@@ -402,6 +482,7 @@ def run(args, stop: threading.Event, status: dict):
     last_save = time.monotonic()
     last_try = 0.0
     last_heat = 0.0
+    heat_idx = 0
     warned_missing = False
     status.update(port=None, kpm=0, total=stats.total)
 
@@ -410,9 +491,12 @@ def run(args, stop: threading.Event, status: dict):
             msg = stats.snapshot(watcher.current if watcher else "")
             status.update(kpm=msg["kpm"], total=msg["total"])
             line = json.dumps(msg, separators=(",", ":"), ensure_ascii=True) + "\n"
-            if time.monotonic() - last_heat >= HEAT_INTERVAL_S:
+            # um modo do mapa de calor por vez, para nao encher o buffer serial do ESP32
+            if time.monotonic() - last_heat >= HEAT_INTERVAL_S / len(HEAT_SCOPES):
                 last_heat = time.monotonic()
-                line += json.dumps(stats.heat_snapshot(), separators=(",", ":"),
+                scope = HEAT_SCOPES[heat_idx % len(HEAT_SCOPES)]
+                heat_idx += 1
+                line += json.dumps(stats.heat_snapshot(scope), separators=(",", ":"),
                                    ensure_ascii=True) + "\n"
 
             if args.stdout:

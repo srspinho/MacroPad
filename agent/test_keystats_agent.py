@@ -90,6 +90,61 @@ class HeatTests(unittest.TestCase):
         self.assertEqual(st.total, 1)
 
 
+class PerAppTests(unittest.TestCase):
+    def tap(self, st, key, n=1):
+        for _ in range(n):
+            st.press(key); st.release(key)
+
+    def test_presses_are_attributed_to_focused_app(self):
+        st = KeyStats(Path("/nonexistent/state.json"))
+        st.snapshot("cs2.exe")
+        self.tap(st, "W", 3)
+        st.snapshot("chrome.exe")
+        self.tap(st, "A", 2)
+        st.snapshot("")                       # nenhum app detectado
+        self.tap(st, "S")
+        self.assertEqual(st.total, 6)
+        self.assertEqual(st.apps["cs2.exe"].counts, {"W": 3})
+        self.assertEqual(st.apps["chrome.exe"].total, 2)
+        snap = st.snapshot("cs2.exe")
+        self.assertEqual(snap["game"]["name"], "cs2.exe")
+        self.assertEqual(snap["game"]["total"], 3)
+        self.assertEqual(snap["game"]["top"], [["W", 3]])
+
+    def test_focus_time(self):
+        st = KeyStats(Path("/nonexistent/state.json"))
+        with mock.patch("keystats_agent.time.monotonic", side_effect=[100.0, 102.5, 110.0]):
+            st.snapshot("cs2.exe")
+            st.snapshot("cs2.exe")
+            st.snapshot("cs2.exe")            # salto de 7,5 s e limitado a 5 s
+        self.assertAlmostEqual(st.apps["cs2.exe"].time, 7.5)
+
+    def test_heat_scopes(self):
+        st = KeyStats(Path("/nonexistent/state.json"))
+        st.counts["Q"] = 50                   # historico antigo
+        st.snapshot("cs2.exe")
+        self.tap(st, "W", 4)
+        self.assertEqual(st.heat_snapshot("total")["heat"]["Q"], 255)
+        sess = st.heat_snapshot("sess")
+        self.assertEqual(sess["heat"], {"W": 255})
+        game = st.heat_snapshot("game")
+        self.assertEqual((game["name"], game["hmax"]), ("cs2.exe", 4))
+        st.snapshot("")
+        self.assertEqual(st.heat_snapshot("game"), {"heat": {}, "hmax": 0, "scope": "game", "name": ""})
+
+    def test_apps_persist(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "state.json"
+            st = KeyStats(path)
+            st.snapshot("cs2.exe")
+            self.tap(st, "W", 2)
+            st.save()
+            again = KeyStats(path)
+            self.assertEqual(again.apps["cs2.exe"].total, 2)
+            self.assertEqual(again.apps["cs2.exe"].session, 0)   # sessao nao persiste
+            self.assertEqual(again.total, 2)
+
+
 class InfraTests(unittest.TestCase):
     def test_single_instance(self):
         first = keystats_agent.acquire_single_instance()
@@ -127,7 +182,7 @@ class InfraTests(unittest.TestCase):
 
     def test_run_stops_on_event(self):
         with tempfile.TemporaryDirectory() as tmp:
-            args = argparse.Namespace(demo=True, stdout=True, no_app=True, port=None,
+            args = argparse.Namespace(demo=True, stdout=True, no_app=False, port=None,
                                       layout="abnt2", state=Path(tmp) / "state.json")
             stop, status, out = threading.Event(), {}, io.StringIO()
             threading.Timer(1.0, stop.set).start()
@@ -136,6 +191,7 @@ class InfraTests(unittest.TestCase):
             lines = out.getvalue().splitlines()
             self.assertGreaterEqual(len(lines), 3)
             self.assertIn('"heat"', out.getvalue())
+            self.assertIn('"game":{"name":"', out.getvalue())
             self.assertTrue((Path(tmp) / "demo_state.json").exists())
 
 

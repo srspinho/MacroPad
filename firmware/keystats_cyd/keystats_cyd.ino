@@ -2,12 +2,15 @@
   KeyStats Panel - firmware MVP para o "Cheap Yellow Display" (ESP32-2432S028R)
 
   Recebe estatisticas de teclado do agente no PC (keystats_agent.py) via USB serial,
-  uma linha JSON por mensagem, e mostra em duas telas:
-    1) AO VIVO   - KPM atual, pico, teclas da sessao, total e grafico dos ultimos 60 s
-    2) TOP TECLAS - as 8 teclas mais usadas
-    3) MAPA DE CALOR - o teclado colorido pela frequencia de uso (ABNT2 ou ANSI)
+  uma linha JSON por mensagem, e mostra em quatro telas:
+    1) AO VIVO    - KPM atual, pico, teclas da sessao, total e grafico dos ultimos 60 s
+    2) POR JOGO   - estatisticas do jogo/app em foco: teclas, recorde de KPM, tempo, top 5
+    3) TOP TECLAS - as 8 teclas mais usadas
+    4) MAPA DE CALOR - o teclado colorido pela frequencia de uso (ABNT2 ou ANSI),
+                       em 3 modos: historico, sessao e jogo atual
 
-  Toque na tela (ou aperte o botao BOOT) para trocar de tela.
+  Toque rapido na tela (ou clique no BOOT): proxima tela.
+  Segure o dedo na tela por 1 s (ou o BOOT por 1-3 s) no mapa de calor: troca o modo.
 
   CONFIGURACAO DO DISPLAY: existem varias revisoes do CYD com displays diferentes.
   No primeiro boot (ou segurando BOOT por 3 s) abre um assistente com uma tela de teste:
@@ -23,9 +26,12 @@
 
   Protocolo (115200 baud, uma linha JSON terminada em '\n'):
     {"kpm":312,"peak":540,"sess":1834,"total":184233,"up":3605,
-     "app":"cs2.exe","top":[["W",5123],["A",3301],["SPACE",2980]]}
-  e, a cada ~2 s, uma linha com o mapa de calor (intensidade 1..255 por tecla):
-    {"heat":{"W":255,"A":204,"SPACE":180},"hmax":5123}
+     "app":"cs2.exe","top":[["W",5123],["A",3301],["SPACE",2980]],
+     "game":{"name":"cs2.exe","total":9120,"sess":812,"peak":610,"time":7260,
+             "top":[["W",2100],["A",1500]]}}
+  e linhas com o mapa de calor (intensidade 1..255 por tecla), uma por modo:
+    {"heat":{"W":255,"A":204,"SPACE":180},"hmax":5123,"scope":"total"}
+    scope: "total" (historico), "sess" (sessao) ou "game" (+ "name": app em foco)
 */
 
 #include "lgfx_cyd.h"
@@ -37,6 +43,9 @@
 static const uint32_t SERIAL_BAUD     = 115200;
 static const uint32_t LINK_TIMEOUT_MS = 3000;   // sem dados por esse tempo = desconectado
 static const uint8_t  TOP_N           = 8;
+static const uint8_t  GAME_TOP_N      = 5;
+static const uint32_t LONG_PRESS_MS   = 1000;   // toque longo
+static const uint32_t TOUCH_UP_MS     = 80;     // tempo sem toque para considerar "soltou"
 static const uint8_t  HIST_N          = 60;     // pontos do grafico (1 por segundo)
 
 static const int PIN_BOOT  = 0;                 // botao BOOT
@@ -62,6 +71,13 @@ struct Stats {
   uint8_t  topCount = 0;
   char     topKey[TOP_N][12];
   uint32_t topVal[TOP_N];
+
+  // jogo/app em foco
+  char     gName[40] = "";
+  uint32_t gTotal = 0, gSess = 0, gPeak = 0, gTime = 0;
+  uint8_t  gTopCount = 0;
+  char     gTopKey[GAME_TOP_N][12];
+  uint32_t gTopVal[GAME_TOP_N];
 };
 
 static LGFX        lcd;
@@ -81,7 +97,7 @@ static bool     topDirty      = true;
 static uint16_t hist[HIST_N];
 static uint8_t  histHead = 0;           // proxima posicao a escrever
 
-enum Screen : uint8_t { SCR_LIVE = 0, SCR_TOP, SCR_HEAT, SCR_COUNT };
+enum Screen : uint8_t { SCR_LIVE = 0, SCR_GAME, SCR_TOP, SCR_HEAT, SCR_COUNT };
 static Screen screen = SCR_LIVE;
 
 static char    lineBuf[2048];
@@ -96,9 +112,15 @@ struct KeyRect {
 static const uint8_t MAX_KEYS = 100;
 static KeyRect  keys[MAX_KEYS];
 static uint8_t  keyCount  = 0;
-static uint8_t  heat[MAX_KEYS];
-static uint32_t heatMax   = 0;
+enum HeatMode : uint8_t { HEAT_TOTAL = 0, HEAT_SESS, HEAT_GAME, HEAT_MODES };
+static const char *const HEAT_SCOPE_NAMES[HEAT_MODES] = {"total", "sess", "game"};
+static const char *const HEAT_MODE_LABELS[HEAT_MODES] = {"HISTORICO", "SESSAO", "JOGO"};
+static uint8_t  heat[HEAT_MODES][MAX_KEYS];
+static uint32_t heatMax[HEAT_MODES];
+static char     heatGame[40] = "";      // app a que o mapa "game" se refere
+static uint8_t  heatMode  = HEAT_TOTAL;
 static bool     heatDirty = true;
+static bool     gameTitleDirty = true;
 static size_t  lineLen = 0;
 
 // ---------------------------------------------------------------- utilidades
@@ -140,15 +162,21 @@ static void handleLine(const char *line) {
 
   JsonObject heatObj = doc["heat"];
   if (!heatObj.isNull()) {
-    memset(heat, 0, sizeof(heat));
+    const char *scope = doc["scope"] | "total";
+    uint8_t m = HEAT_TOTAL;
+    for (uint8_t i = 0; i < HEAT_MODES; i++)
+      if (strcmp(scope, HEAT_SCOPE_NAMES[i]) == 0) m = i;
+
+    memset(heat[m], 0, sizeof(heat[m]));
     for (JsonPair kv : heatObj) {
       const char *k = kv.key().c_str();
       uint8_t v = kv.value() | 0;
       for (uint8_t i = 0; i < keyCount; i++)   // sem break: ENTER ISO ocupa 2 retangulos
-        if (strcmp(keys[i].name, k) == 0) heat[i] = v;
+        if (strcmp(keys[i].name, k) == 0) heat[m][i] = v;
     }
-    heatMax = doc["hmax"] | 0;
-    heatDirty = true;
+    heatMax[m] = doc["hmax"] | 0;
+    if (m == HEAT_GAME) strlcpy(heatGame, doc["name"] | "", sizeof(heatGame));
+    if (m == heatMode) heatDirty = true;
     lastMsgMs = millis();
     everConnected = true;
     return;
@@ -172,6 +200,25 @@ static void handleLine(const char *line) {
     }
     st.topCount = n;
     topDirty = true;
+  }
+
+  JsonObject game = doc["game"];
+  if (!game.isNull()) {
+    const char *name = game["name"] | "";
+    if (strcmp(name, st.gName) != 0) gameTitleDirty = true;
+    strlcpy(st.gName, name, sizeof(st.gName));
+    st.gTotal = game["total"] | 0;
+    st.gSess  = game["sess"]  | 0;
+    st.gPeak  = game["peak"]  | 0;
+    st.gTime  = game["time"]  | 0;
+    uint8_t n = 0;
+    for (JsonArray item : game["top"].as<JsonArray>()) {
+      if (n >= GAME_TOP_N) break;
+      strlcpy(st.gTopKey[n], item[0] | "?", sizeof(st.gTopKey[n]));
+      st.gTopVal[n] = item[1] | 0;
+      n++;
+    }
+    st.gTopCount = n;
   }
 
   lastMsgMs = millis();
@@ -242,18 +289,23 @@ static const int KPM_X = 4, KPM_Y = 28, KPM_W = 192, KPM_H = 104;
 static const int BOX_X = 200, BOX_W = 116, BOX_H = 33;
 static const int GR_X = 4, GR_Y = 138, GR_W = 312, GR_H = 98;
 
-static void drawStatBox(int y, const char *label, uint32_t value, uint16_t color) {
-  char buf[16];
-  fmtThousands(value, buf, sizeof(buf));
-  lcd.fillRoundRect(BOX_X, y, BOX_W, BOX_H, 4, C_PANEL);
+static void drawStatBoxAt(int x, int y, int w, const char *label, const char *value,
+                          uint16_t color) {
+  lcd.fillRoundRect(x, y, w, BOX_H, 4, C_PANEL);
   lcd.setFont(&fonts::Font0);
   lcd.setTextDatum(top_left);
   lcd.setTextColor(C_DIM, C_PANEL);
-  lcd.drawString(label, BOX_X + 6, y + 3);
+  lcd.drawString(label, x + 6, y + 3);
   lcd.setFont(&fonts::Font2);
   lcd.setTextDatum(bottom_right);
   lcd.setTextColor(color, C_PANEL);
-  lcd.drawString(buf, BOX_X + BOX_W - 6, y + BOX_H - 2);
+  lcd.drawString(value, x + w - 6, y + BOX_H - 2);
+}
+
+static void drawStatBox(int y, const char *label, uint32_t value, uint16_t color) {
+  char buf[16];
+  fmtThousands(value, buf, sizeof(buf));
+  drawStatBoxAt(BOX_X, y, BOX_W, label, buf, color);
 }
 
 static void drawKpm() {
@@ -443,7 +495,7 @@ static void drawHeatRows() {
     g->fillRect(0, oy, 320, row.h, C_BG);
     for (uint8_t i = 0; i < keyCount; i++) {
       if (keys[i].row != r) continue;
-      uint8_t v = heat[i];
+      uint8_t v = heat[heatMode][i];
       uint16_t bg = v ? heatColor(v) : C_PANEL;
       uint16_t fg = !v ? C_DIM : (v > 110 ? (uint16_t)0x0000 : C_TEXT);
       int x = keys[i].x + 1, w = keys[i].w - 2;
@@ -455,32 +507,46 @@ static void drawHeatRows() {
   }
 }
 
+static const uint16_t HEAT_MODE_COLORS[HEAT_MODES] = {C_ACCENT, C_OK, C_ACC2};
+
 static void drawHeatLegend() {
   LovyanGFX *g = sprRow.getBuffer() ? (LovyanGFX *)&sprRow : (LovyanGFX *)&lcd;
-  // linha 1: barra de cores
+
+  // linha 1: modo atual + escala de cores + dica
   int oy = (g == &lcd) ? 188 : 0;
   g->fillRect(0, oy, 320, 26, C_BG);
-  for (int x = 0; x < 200; x++) g->drawFastVLine(60 + x, oy + 8, 10, heatColor(1 + x * 254 / 199));
+  g->fillRoundRect(4, oy + 4, 86, 18, 4, HEAT_MODE_COLORS[heatMode]);
+  g->setFont(&fonts::Font2);
+  g->setTextDatum(middle_center);
+  g->setTextColor(0x0000, HEAT_MODE_COLORS[heatMode]);
+  g->drawString(HEAT_MODE_LABELS[heatMode], 47, oy + 13);
+  for (int x = 0; x < 110; x++) g->drawFastVLine(100 + x, oy + 8, 10, heatColor(1 + x * 254 / 109));
   g->setFont(&fonts::Font0);
-  g->setTextColor(C_DIM, C_BG);
   g->setTextDatum(middle_right);
-  g->drawString("pouco", 55, oy + 13);
-  g->setTextDatum(middle_left);
-  g->drawString("muito", 265, oy + 13);
+  g->setTextColor(C_DIM, C_BG);
+  g->drawString("segure: trocar", 316, oy + 13);
   if (g == &sprRow) sprRow.pushSprite(0, 188);
 
-  // linha 2: legenda
+  // linha 2: tecla mais usada no modo atual
   oy = (g == &lcd) ? 214 : 0;
   g->fillRect(0, oy, 320, 26, C_BG);
   g->setFont(&fonts::Font2);
   g->setTextDatum(middle_center);
-  char buf[64], num[16];
-  if (heatMax && st.topCount) {
-    fmtThousands(heatMax, num, sizeof(num));
-    const char *lbl = labelFor(st.topKey[0]);
-    if (strcmp(lbl, "CCED") == 0) lbl = "C cedilha";
-    else if (strcmp(lbl, "ACUTE") == 0) lbl = "acento";
-    snprintf(buf, sizeof(buf), "%s  |  mais usada: %s (%s)", LAYOUT_NAME, lbl, num);
+  char buf[80], num[16];
+  const char *top = nullptr;
+  for (uint8_t i = 0; i < keyCount && !top; i++)
+    if (heat[heatMode][i] == 255) top = keys[i].label[0] ? keys[i].label : keys[i].name;
+  if (top && strcmp(top, "CCED") == 0) top = "C cedilha";
+  else if (top && strcmp(top, "ACUTE") == 0) top = "acento";
+
+  if (heatMode == HEAT_GAME && !heatGame[0]) {
+    snprintf(buf, sizeof(buf), "nenhum jogo em foco");
+  } else if (heatMax[heatMode]) {
+    fmtThousands(heatMax[heatMode], num, sizeof(num));
+    if (heatMode == HEAT_GAME)
+      snprintf(buf, sizeof(buf), "%.18s: %s (%s)", heatGame, top ? top : "-", num);
+    else
+      snprintf(buf, sizeof(buf), "%s  |  mais usada: %s (%s)", LAYOUT_NAME, top ? top : "-", num);
   } else {
     snprintf(buf, sizeof(buf), "%s  |  aguardando dados...", LAYOUT_NAME);
   }
@@ -489,14 +555,84 @@ static void drawHeatLegend() {
   if (g == &sprRow) sprRow.pushSprite(0, 214);
 }
 
+// ---------------------------------------------------------------- tela POR JOGO
+static void fmtFocus(uint32_t s, char *out, size_t n) {
+  if (s < 60)        snprintf(out, n, "%lus", (unsigned long)s);
+  else if (s < 3600) snprintf(out, n, "%lum %02lus", (unsigned long)(s / 60), (unsigned long)(s % 60));
+  else               snprintf(out, n, "%luh %02lum", (unsigned long)(s / 3600),
+                              (unsigned long)((s / 60) % 60));
+}
+
+static const int GAME_BOX_W = 154, GAME_ROW_Y0 = 132, GAME_ROW_H = 20;
+
+static void drawGameTitle() {
+  lcd.fillRect(0, 24, 320, 32, C_BG);
+  lcd.setTextDatum(middle_left);
+  if (st.gName[0]) {
+    lcd.setFont(&fonts::FreeSansBold12pt7b);
+    lcd.setTextColor(C_ACCENT, C_BG);
+    lcd.setClipRect(6, 24, 308, 32);
+    lcd.drawString(st.gName, 6, 41);
+    lcd.clearClipRect();
+  } else {
+    lcd.setFont(&fonts::Font2);
+    lcd.setTextColor(C_DIM, C_BG);
+    lcd.drawString("Nenhum jogo em foco", 6, 41);
+  }
+}
+
+static void drawGameDynamic() {
+  if (gameTitleDirty) { gameTitleDirty = false; drawGameTitle(); }
+
+  char buf[16];
+  fmtThousands(st.gTotal, buf, sizeof(buf));
+  drawStatBoxAt(4, 58, GAME_BOX_W, "TECLAS NO JOGO", buf, C_ACCENT);
+  fmtThousands(st.gSess, buf, sizeof(buf));
+  drawStatBoxAt(162, 58, GAME_BOX_W, "NESTA SESSAO", buf, C_TEXT);
+  fmtThousands(st.gPeak, buf, sizeof(buf));
+  drawStatBoxAt(4, 94, GAME_BOX_W, "RECORDE (KPM)", buf, C_ACC2);
+  fmtFocus(st.gTime, buf, sizeof(buf));
+  drawStatBoxAt(162, 94, GAME_BOX_W, "TEMPO EM FOCO", buf, C_OK);
+
+  // top 5 teclas do jogo (o sprite tem 26 px; cada linha cobre a sobra da anterior)
+  uint32_t maxV = (st.gTopCount && st.gTopVal[0]) ? st.gTopVal[0] : 1;
+  for (uint8_t i = 0; i < GAME_TOP_N; i++) {
+    LovyanGFX *g = sprRow.getBuffer() ? (LovyanGFX *)&sprRow : (LovyanGFX *)&lcd;
+    int oy = (g == &lcd) ? GAME_ROW_Y0 + i * GAME_ROW_H : 0;
+    int h = (g == &lcd) ? GAME_ROW_H : 26;
+    g->fillRect(0, oy, 320, h, C_BG);
+    if (i < st.gTopCount) {
+      g->fillRoundRect(4, oy + 1, 50, GAME_ROW_H - 2, 3, C_PANEL);
+      drawKeyLabel(g, labelFor(st.gTopKey[i]), 29, oy + GAME_ROW_H / 2, C_TEXT, C_PANEL, true);
+      const int bx = 60, bw = 190;
+      int w = (int)((uint64_t)st.gTopVal[i] * bw / maxV);
+      if (w < 2) w = 2;
+      g->fillRoundRect(bx, oy + 5, bw, GAME_ROW_H - 10, 3, C_PANEL);
+      g->fillRoundRect(bx, oy + 5, w,  GAME_ROW_H - 10, 3, i == 0 ? C_ACC2 : C_ACCENT);
+      fmtThousands(st.gTopVal[i], buf, sizeof(buf));
+      g->setFont(&fonts::Font2);
+      g->setTextDatum(middle_right);
+      g->setTextColor(C_DIM, C_BG);
+      g->drawString(buf, 316, oy + GAME_ROW_H / 2);
+    } else if (i == 0) {
+      g->setFont(&fonts::Font2);
+      g->setTextDatum(middle_center);
+      g->setTextColor(C_DIM, C_BG);
+      g->drawString("Nenhuma tecla neste jogo ainda", 160, oy + GAME_ROW_H / 2);
+    }
+    if (g == &sprRow) sprRow.pushSprite(0, GAME_ROW_Y0 + i * GAME_ROW_H);
+  }
+}
+
 // ---------------------------------------------------------------- navegacao
 static void redrawAll() {
   drawHeader();
   if (!linkUp && !everConnected) { drawWaiting(); return; }
   lcd.fillRect(0, 24, 320, 216, C_BG);
-  if (screen == SCR_LIVE)     { drawLiveDynamic(); drawGraph(); }
-  else if (screen == SCR_TOP) { drawTopRows(); }
-  else                        { drawHeatRows(); drawHeatLegend(); }
+  if (screen == SCR_LIVE)      { drawLiveDynamic(); drawGraph(); }
+  else if (screen == SCR_GAME) { gameTitleDirty = true; drawGameDynamic(); }
+  else if (screen == SCR_TOP)  { drawTopRows(); }
+  else                         { drawHeatRows(); drawHeatLegend(); }
 }
 
 static void nextScreen() {
@@ -505,35 +641,51 @@ static void nextScreen() {
   redrawAll();
 }
 
-static bool pollInput() {
-  static bool wasTouched = false, wasPressed = false;
-  static uint32_t lastChange = 0;
-  bool fired = false;
+enum InputEvent : uint8_t { IN_NONE, IN_TAP, IN_LONG };
+
+// Toque/clique curto = IN_TAP; toque longo (1 s) ou BOOT segurado por 1-3 s = IN_LONG;
+// BOOT segurado por mais de 3 s = abre o assistente do display.
+static InputEvent pollInput() {
+  static bool     wasPressed = false, touchActive = false, longFired = false;
+  static uint32_t bootDownAt = 0, touchStart = 0, touchSeen = 0, lastTap = 0;
 
   int32_t tx, ty;
-  static uint32_t bootDownAt = 0;
   bool touched = lcd.getTouch(&tx, &ty) > 0;
   bool pressed = digitalRead(PIN_BOOT) == LOW;
   uint32_t now = millis();
+  InputEvent ev = IN_NONE;
 
-  // BOOT: clique curto (ao soltar) troca de tela; segurar 3 s abre o assistente do display
+  // botao BOOT (avaliado ao soltar)
   if (pressed && !wasPressed) bootDownAt = now;
   if (pressed && now - bootDownAt > 3000) {
     prefs.putBool("dok", false);
     delay(50);
     ESP.restart();
   }
-  bool bootClick = !pressed && wasPressed && now - bootDownAt < 1000;
-
-  if (now - lastChange > 250) {
-    if ((touched && !wasTouched) || bootClick) {
-      fired = true;
-      lastChange = now;
-    }
-  }
-  wasTouched = touched;
+  if (!pressed && wasPressed) ev = (now - bootDownAt < LONG_PRESS_MS) ? IN_TAP : IN_LONG;
   wasPressed = pressed;
-  return fired;
+
+  // touch: o XPT2046 "pisca" durante o toque, entao so considera solto apos TOUCH_UP_MS
+  if (touched) {
+    touchSeen = now;
+    if (!touchActive) {
+      touchActive = true;
+      longFired = false;
+      touchStart = now;
+    } else if (!longFired && now - touchStart >= LONG_PRESS_MS) {
+      longFired = true;
+      ev = IN_LONG;  // dispara ainda segurando, para dar retorno imediato
+    }
+  } else if (touchActive && now - touchSeen > TOUCH_UP_MS) {
+    touchActive = false;
+    if (!longFired) ev = IN_TAP;
+  }
+
+  if (ev == IN_TAP) {
+    if (now - lastTap < 250) ev = IN_NONE;
+    else lastTap = now;
+  }
+  return ev;
 }
 
 // ---------------------------------------------------------------- assistente do display
@@ -666,6 +818,7 @@ void setup() {
   lcd.fillScreen(C_BG);
 
   if (!displayOk) runDisplaySetup(prof, rot);
+  heatMode = prefs.getUChar("hmode", HEAT_TOTAL) % HEAT_MODES;
   setLed(false, false, true);
 
   // sprites evitam o "pisca" ao redesenhar; se faltar RAM, desenha direto na tela
@@ -680,6 +833,7 @@ void setup() {
 
   memset(hist, 0, sizeof(hist));
   memset(heat, 0, sizeof(heat));
+  memset(heatMax, 0, sizeof(heatMax));
   buildLayout();
   redrawAll();
 }
@@ -698,7 +852,16 @@ void loop() {
     redrawAll();
   }
 
-  if (pollInput()) nextScreen();
+  InputEvent ev = pollInput();
+  if (ev == IN_TAP) {
+    nextScreen();
+  } else if (ev == IN_LONG && screen == SCR_HEAT && everConnected) {
+    heatMode = (heatMode + 1) % HEAT_MODES;
+    prefs.putUChar("hmode", heatMode);
+    heatDirty = false;
+    drawHeatRows();
+    drawHeatLegend();
+  }
 
   // historico: uma amostra por segundo
   static uint32_t lastSample = 0;
@@ -717,6 +880,8 @@ void loop() {
     drawHeader();
     if (screen == SCR_LIVE) {
       drawLiveDynamic();
+    } else if (screen == SCR_GAME) {
+      drawGameDynamic();
     } else if (screen == SCR_TOP && topDirty) {
       topDirty = false;
       drawTopRows();
