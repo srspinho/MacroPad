@@ -12,14 +12,20 @@ Uso:
     python keystats_agent.py --demo          # dados simulados (sem capturar teclado)
     python keystats_agent.py --stdout        # imprime o JSON em vez de enviar
     python keystats_agent.py --layout ansi   # teclado US (padrao: abnt2)
+    pythonw keystats_agent.py --tray         # sem terminal, com icone na bandeja
+    python keystats_agent.py --install-autostart    # iniciar junto com o sistema
+    python keystats_agent.py --uninstall-autostart
 """
 
 import argparse
 import collections
 import ctypes
 import json
+import logging
+import logging.handlers
 import os
 import random
+import socket
 import subprocess
 import sys
 import threading
@@ -48,7 +54,12 @@ KNOWN_VIDS = {
     0x303A: "Espressif USB",
 }
 
-DEFAULT_STATE = Path.home() / ".keystats" / "state.json"
+DATA_DIR = Path.home() / ".keystats"
+DEFAULT_STATE = DATA_DIR / "state.json"
+LOG_FILE = DATA_DIR / "agent.log"
+INSTANCE_PORT = 47219   # porta local usada so para impedir duas copias do agente
+
+log = logging.getLogger("keystats")
 
 
 # --------------------------------------------------------------------------- nomes de tecla
@@ -157,7 +168,7 @@ class KeyStats:
         except FileNotFoundError:
             pass
         except (ValueError, OSError) as exc:
-            print(f"[aviso] nao consegui ler {self.state_file}: {exc}", file=sys.stderr)
+            log.warning("nao consegui ler %s: %s", self.state_file, exc)
 
     def save(self):
         with self.lock:
@@ -320,31 +331,67 @@ def open_serial(port: str):
     return ser
 
 
-# --------------------------------------------------------------------------- main
-def main():
-    ap = argparse.ArgumentParser(description="Envia estatisticas de teclado para o KeyStats Panel")
-    ap.add_argument("--port", help="porta serial (ex.: COM5, /dev/ttyUSB0). Padrao: auto")
-    ap.add_argument("--demo", action="store_true", help="usa digitacao simulada")
-    ap.add_argument("--stdout", action="store_true", help="imprime o JSON em vez de enviar pela serial")
-    ap.add_argument("--state", type=Path, default=DEFAULT_STATE, help="arquivo de estado (contagens)")
-    ap.add_argument("--no-app", action="store_true", help="nao detectar o aplicativo ativo")
-    ap.add_argument("--layout", choices=sorted(SHIFTED), default="abnt2",
-                    help="layout fisico do teclado (padrao: abnt2)")
-    args = ap.parse_args()
+# --------------------------------------------------------------------------- infraestrutura
+def setup_logging(console: bool = True):
+    """Log no terminal (se houver) e sempre em ~/.keystats/agent.log."""
+    log.setLevel(logging.INFO)
+    log.handlers.clear()
+    try:
+        LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+        fh = logging.handlers.RotatingFileHandler(LOG_FILE, maxBytes=1_000_000,
+                                                  backupCount=2, encoding="utf-8")
+        fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+        log.addHandler(fh)
+    except OSError:
+        pass
+    # com pythonw (sem terminal) sys.stderr e None
+    if console and sys.stderr is not None:
+        ch = logging.StreamHandler(sys.stderr)
+        ch.setFormatter(logging.Formatter("%(message)s"))
+        log.addHandler(ch)
 
-    if not args.stdout and serial is None:
-        sys.exit("Instale as dependencias: pip install -r requirements.txt")
 
+def acquire_single_instance():
+    """Retorna um socket que 'segura' a instancia, ou None se ja houver outra rodando."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    if sys.platform == "win32":
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+    try:
+        sock.bind(("127.0.0.1", INSTANCE_PORT))
+        sock.listen(1)
+        return sock
+    except OSError:
+        sock.close()
+        return None
+
+
+def autostart_args(args) -> list:
+    """Opcoes da linha de comando que devem ser repetidas na inicializacao automatica."""
+    out = []
+    if args.port:
+        out += ["--port", args.port]
+    if args.layout != "abnt2":
+        out += ["--layout", args.layout]
+    if args.state != DEFAULT_STATE:
+        out += ["--state", str(args.state.resolve())]
+    if args.no_app:
+        out.append("--no-app")
+    return out
+
+
+# --------------------------------------------------------------------------- loop principal
+def run(args, stop: threading.Event, status: dict):
+    """Captura e envia ate `stop` ser sinalizado. `status` e lido pelo icone da bandeja."""
     # no modo demo nao misturamos dados falsos com o historico real
     state_file = args.state if not args.demo else args.state.with_name("demo_state.json")
     stats = KeyStats(state_file)
 
     if args.demo:
         start_demo(stats)
-        print("Modo demo: gerando digitacao simulada.")
+        log.info("Modo demo: gerando digitacao simulada.")
     else:
         start_keyboard_capture(stats, args.layout)
-        print("Capturando teclado (apenas contagens). Ctrl+C para sair.")
+        log.info("Capturando teclado (apenas contagens).")
 
     watcher = None
     if not args.no_app:
@@ -355,10 +402,13 @@ def main():
     last_save = time.monotonic()
     last_try = 0.0
     last_heat = 0.0
+    warned_missing = False
+    status.update(port=None, kpm=0, total=stats.total)
 
     try:
-        while True:
+        while not stop.is_set():
             msg = stats.snapshot(watcher.current if watcher else "")
+            status.update(kpm=msg["kpm"], total=msg["total"])
             line = json.dumps(msg, separators=(",", ":"), ensure_ascii=True) + "\n"
             if time.monotonic() - last_heat >= HEAT_INTERVAL_S:
                 last_heat = time.monotonic()
@@ -375,34 +425,99 @@ def main():
                     if port:
                         try:
                             ser = open_serial(port)
-                            print(f"Conectado em {port} ({kind}).")
+                            warned_missing = False
+                            status["port"] = port
+                            log.info("Conectado em %s (%s).", port, kind)
                         except serial.SerialException as exc:
-                            print(f"[aviso] nao consegui abrir {port}: {exc}")
-                    else:
-                        print("Painel nao encontrado. Conecte o USB ou use --port.")
+                            if not warned_missing:
+                                log.warning("nao consegui abrir %s: %s", port, exc)
+                                warned_missing = True
+                    elif not warned_missing:
+                        log.info("Painel nao encontrado. Conecte o USB ou use --port.")
+                        warned_missing = True
                 if ser is not None:
                     try:
                         ser.write(line.encode("ascii"))
                         ser.reset_input_buffer()  # descarta logs de boot do ESP32
                     except (serial.SerialException, OSError) as exc:
-                        print(f"[aviso] conexao perdida: {exc}")
+                        log.warning("conexao perdida: %s", exc)
                         try:
                             ser.close()
                         except Exception:
                             pass
                         ser = None
+                        status["port"] = None
 
             if time.monotonic() - last_save > SAVE_INTERVAL_S:
                 stats.save()
                 last_save = time.monotonic()
 
-            time.sleep(SEND_INTERVAL_S)
-    except KeyboardInterrupt:
-        print("\nSaindo...")
+            stop.wait(SEND_INTERVAL_S)
     finally:
         stats.save()
         if ser is not None:
             ser.close()
+        status["port"] = None
+        log.info("Agente encerrado.")
+
+
+# --------------------------------------------------------------------------- main
+def main():
+    ap = argparse.ArgumentParser(description="Envia estatisticas de teclado para o KeyStats Panel")
+    ap.add_argument("--port", help="porta serial (ex.: COM5, /dev/ttyUSB0). Padrao: auto")
+    ap.add_argument("--demo", action="store_true", help="usa digitacao simulada")
+    ap.add_argument("--stdout", action="store_true", help="imprime o JSON em vez de enviar pela serial")
+    ap.add_argument("--state", type=Path, default=DEFAULT_STATE, help="arquivo de estado (contagens)")
+    ap.add_argument("--no-app", action="store_true", help="nao detectar o aplicativo ativo")
+    ap.add_argument("--layout", choices=sorted(SHIFTED), default="abnt2",
+                    help="layout fisico do teclado (padrao: abnt2)")
+    ap.add_argument("--tray", action="store_true",
+                    help="roda em segundo plano com icone na bandeja do sistema")
+    ap.add_argument("--install-autostart", action="store_true",
+                    help="inicia o agente (com --tray) junto com o sistema")
+    ap.add_argument("--uninstall-autostart", action="store_true",
+                    help="remove a inicializacao automatica")
+    args = ap.parse_args()
+
+    setup_logging(console=not args.stdout)
+
+    if args.install_autostart or args.uninstall_autostart:
+        import autostart
+        if args.install_autostart:
+            where = autostart.install(autostart_args(args))
+            log.info("Inicializacao automatica ativada (%s).", where)
+            log.info("O agente vai abrir com o icone na bandeja no proximo login.")
+        else:
+            removed = autostart.uninstall()
+            log.info("Inicializacao automatica %s.", "removida" if removed else "nao estava ativa")
+        return
+
+    if not args.stdout and serial is None:
+        sys.exit("Instale as dependencias: pip install -r requirements.txt")
+
+    lock = None
+    if not args.stdout:
+        lock = acquire_single_instance()
+        if lock is None:
+            log.error("O agente ja esta rodando (veja o icone na bandeja). Saindo.")
+            sys.exit(1)
+
+    stop = threading.Event()
+    status = {"port": None, "kpm": 0, "total": 0}
+    try:
+        if args.tray:
+            import tray
+            tray.run_tray(stop, status, worker=lambda: run(args, stop, status),
+                          autostart_args=autostart_args(args), data_dir=DATA_DIR)
+        else:
+            log.info("Ctrl+C para sair.")
+            run(args, stop, status)
+    except KeyboardInterrupt:
+        stop.set()
+        log.info("Saindo...")
+    finally:
+        if lock is not None:
+            lock.close()
 
 
 if __name__ == "__main__":

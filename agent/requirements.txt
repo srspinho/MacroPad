@@ -1,2 +1,5 @@
 pyserial>=3.5
 pynput>=1.7
+# modo --tray (icone na bandeja)
+pystray>=0.19
+Pillow>=10

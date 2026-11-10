@@ -37,6 +37,8 @@ MacroPad/
 │   └── keyboard_layout.h  # layouts ABNT2/ANSI do mapa de calor
 ├── agent/
 │   ├── keystats_agent.py       # agente que roda no PC
+│   ├── tray.py                 # ícone na bandeja (modo --tray)
+│   ├── autostart.py            # iniciar junto com o sistema
 │   ├── test_keystats_agent.py  # testes (python -m unittest)
 │   └── requirements.txt
 └── docs/preview_heatmap.png
@@ -105,8 +107,39 @@ Opções úteis:
 | `--stdout` | imprimir o JSON no terminal em vez de enviar |
 | `--no-app` | não detectar o aplicativo em foco |
 | `--layout ansi` | teclado americano (padrão: `abnt2`) |
+| `--tray` | roda sem terminal, com ícone na bandeja |
+| `--install-autostart` | inicia o agente (com `--tray`) junto com o sistema |
+| `--uninstall-autostart` | desliga a inicialização automática |
 
 **Importante:** feche o *Monitor Serial* da Arduino IDE antes de rodar o agente, porque só um programa pode usar a porta por vez.
+
+### Rodar em segundo plano e iniciar com o Windows
+
+Depois de confirmar que tudo funciona no terminal, ative a inicialização automática uma vez:
+
+```bash
+python keystats_agent.py --install-autostart
+```
+
+A partir do próximo login, o agente abre sozinho, **sem janela de terminal**, com um ícone de keycap na bandeja do sistema (perto do relógio):
+
+- **ponto verde** = conectado ao painel; **cinza** = painel desconectado
+- passe o mouse para ver a porta e o KPM atual
+- clique com o botão direito para: *Abrir pasta de dados*, ligar/desligar *Iniciar com o sistema* e *Sair*
+
+Para abrir agora mesmo, sem reiniciar o PC:
+
+```bash
+pythonw keystats_agent.py --tray
+```
+
+Opções como `--port COM5` ou `--layout ansi` passadas junto com `--install-autostart` são repetidas na inicialização automática.
+
+Sem terminal, as mensagens vão para `~/.keystats/agent.log` (no Windows, `C:\Users\<você>\.keystats\agent.log`). Consulte esse arquivo se o ícone ficar cinza.
+Só uma cópia do agente roda por vez: se você abrir outra pelo terminal, ela avisa que já há uma rodando e fecha.
+
+> No Windows, a inicialização automática fica em `HKCU\...\CurrentVersion\Run` e não precisa de administrador. Para desligar, use o menu do ícone ou `--uninstall-autostart`.
+> No Linux, o ícone na bandeja depende do ambiente gráfico (GNOME pode precisar da extensão *AppIndicator*).
 
 ### Observações por sistema
 

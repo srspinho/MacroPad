@@ -1,10 +1,20 @@
 """Testes do agente. Rode com:  python -m unittest test_keystats_agent.py"""
 
+import argparse
+import io
+import os
 import re
+import sys
+import tempfile
+import threading
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 from types import SimpleNamespace as K
+from unittest import mock
 
+import autostart
+import keystats_agent
 from keystats_agent import KeyStats, key_name
 
 LAYOUT_H = Path(__file__).resolve().parent.parent / "firmware" / "keystats_cyd" / "keyboard_layout.h"
@@ -78,6 +88,55 @@ class HeatTests(unittest.TestCase):
             st.press("W")                       # auto-repeat
         st.release("W")
         self.assertEqual(st.total, 1)
+
+
+class InfraTests(unittest.TestCase):
+    def test_single_instance(self):
+        first = keystats_agent.acquire_single_instance()
+        self.assertIsNotNone(first)
+        try:
+            self.assertIsNone(keystats_agent.acquire_single_instance())
+        finally:
+            first.close()
+        again = keystats_agent.acquire_single_instance()
+        self.assertIsNotNone(again)
+        again.close()
+
+    def test_autostart_args(self):
+        args = argparse.Namespace(port="COM5", layout="ansi", state=keystats_agent.DEFAULT_STATE,
+                                  no_app=True)
+        self.assertEqual(keystats_agent.autostart_args(args),
+                         ["--port", "COM5", "--layout", "ansi", "--no-app"])
+        args = argparse.Namespace(port=None, layout="abnt2", state=keystats_agent.DEFAULT_STATE,
+                                  no_app=False)
+        self.assertEqual(keystats_agent.autostart_args(args), [])
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "teste do formato XDG")
+    def test_autostart_linux_roundtrip(self):
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": tmp}):
+            self.assertFalse(autostart.is_installed())
+            path = autostart.install(["--layout", "ansi"])
+            self.assertTrue(autostart.is_installed())
+            text = Path(path).read_text()
+            self.assertIn("--tray --layout ansi", text)
+            self.assertIn("keystats_agent.py", text)
+            self.assertTrue(autostart.uninstall())
+            self.assertFalse(autostart.is_installed())
+            self.assertFalse(autostart.uninstall())
+
+    def test_run_stops_on_event(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            args = argparse.Namespace(demo=True, stdout=True, no_app=True, port=None,
+                                      layout="abnt2", state=Path(tmp) / "state.json")
+            stop, status, out = threading.Event(), {}, io.StringIO()
+            threading.Timer(1.0, stop.set).start()
+            with redirect_stdout(out):
+                keystats_agent.run(args, stop, status)
+            lines = out.getvalue().splitlines()
+            self.assertGreaterEqual(len(lines), 3)
+            self.assertIn('"heat"', out.getvalue())
+            self.assertTrue((Path(tmp) / "demo_state.json").exists())
 
 
 if __name__ == "__main__":
